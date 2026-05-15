@@ -1,0 +1,12 @@
+version: v2
+modules:
+  - path: proto
+lint:
+  use:
+    - DEFAULT
+  except:
+    # Allow non-google-style enum value prefix variations if the existing
+    # contract conflicts; toggle as needed.
+breaking:
+  use:
+    - FILE

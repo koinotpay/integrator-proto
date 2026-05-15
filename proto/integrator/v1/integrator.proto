@@ -1,0 +1,185 @@
+syntax = "proto3";
+
+package koinotpay.integrator.v1;
+
+option go_package = "github.com/koinotpay/integrator-proto/gen/go/integrator/v1;integratorv1";
+
+// IntegratorService is the contract every vendor-integrator microservice
+// (humo, alif, korti-milli, …) implements. The koinotpay gateway is the
+// only client; integrators are the only servers.
+//
+// Wire conventions:
+//   * "amount" fields are sent as strings to preserve NUMERIC(20,4) precision.
+//   * Idempotency-Key flows in PaymentRequest.idempotency_key; the integrator
+//     MUST dedupe by that within at least a 24h window.
+//   * Status is a small enum the gateway maps directly to its state machine.
+//     Error classification is in error_code (machine-readable token), with
+//     message reserved for human-readable detail.
+service IntegratorService {
+  // SubmitPayment carries a fresh payment to the upstream provider.
+  rpc SubmitPayment(PaymentRequest) returns (PaymentResponse);
+  // CheckPayment polls a previously-submitted payment for its current status.
+  rpc CheckPayment(PaymentRequest) returns (PaymentResponse);
+  // GetInfo fetches account/requisite info pre-payment.
+  rpc GetInfo(InfoRequest) returns (InfoResponse);
+}
+
+// Status is the single dimension of payment outcome. error_code carries the
+// classification within FAILED/RETRY/TIMEOUT; message is the human string.
+//
+//   SUCCESS  → terminal, payment confirmed.
+//   FAILED   → terminal, payment rejected by upstream. error_code MUST be set
+//              to one of the FailureCode tokens below.
+//   PENDING  → non-terminal, gateway should poll via CheckPayment after a
+//              backoff. Replaces the old INDETERMINATE/NEED_CHECK split —
+//              the upstream simply tells us "not yet, ask again".
+//   RETRY    → non-terminal, transient upstream condition; gateway should
+//              re-submit (not poll) after a backoff. error_code SHOULD be set
+//              to a RetryCode token to aid observability.
+//   TIMEOUT  → non-terminal, request did not reach a verdict in time;
+//              gateway should re-submit. Distinguished from RETRY only so
+//              dashboards can split network failures from service errors.
+enum Status {
+  STATUS_UNSPECIFIED = 0;
+  STATUS_SUCCESS     = 1;
+  STATUS_FAILED      = 2;
+  STATUS_PENDING     = 3;
+  STATUS_RETRY       = 4;
+  STATUS_TIMEOUT     = 5;
+}
+
+message KV {
+  string key   = 1;
+  string value = 2;
+}
+
+message Endpoint {
+  int64  endpoint_id  = 1;
+  string description  = 2;
+}
+
+message Agent {
+  int64  agent_id        = 1;
+  int64  parent_agent_id = 2;
+  string name            = 3;
+  string description     = 4;
+  string phone           = 5;
+  string address         = 6;
+  string currency        = 7;
+}
+
+message Gateway {
+  int64  gateway_id     = 1;
+  string name           = 2;
+  string unique         = 3;
+  // field 4 was api_key — moved to gRPC metadata "x-api-key" so it never
+  // appears in payload dumps; tag reserved to prevent accidental reuse.
+  reserved 4;
+  reserved "api_key";
+}
+
+message Service {
+  int64  service_id          = 1;
+  string name                = 2;
+  string pay_min             = 3; // decimal string
+  string pay_max             = 4; // decimal string
+  string provider_service_id = 5;
+  repeated ServiceInput inputs = 6;
+}
+
+message ServiceInput {
+  int64  index  = 1;
+  string title  = 2;
+  string regexp = 3;
+}
+
+message Provider {
+  int64  provider_id  = 1;
+  string name         = 2;
+  string currency     = 3;
+}
+
+message PaymentRequest {
+  Endpoint endpoint              = 1;
+  Agent    agent                 = 2;
+  Gateway  gateway               = 3;
+  Service  service               = 4;
+  Provider provider              = 5;
+
+  int64    payment_id            = 6;
+  string   trnx_id               = 7;
+  repeated string input_data     = 8;
+  string   amount                = 9;  // decimal string in agent currency
+  string   amount_to_credit      = 10; // decimal string
+  string   amount_to_gw          = 11; // decimal string in provider currency
+  string   amount_to_credit_to_gw = 12; // decimal string
+  string   currency              = 13;
+  string   currency_to_credit    = 14;
+  repeated KV items              = 15;
+
+  // idempotency_key MUST be propagated to upstream; safe re-tries depend on it.
+  string   idempotency_key       = 16;
+}
+
+message PaymentResponse {
+  Status status         = 1;
+  string message        = 2;
+  string reference_id   = 3;
+  // confirmed_amount lets the upstream authoritatively replace the amount
+  // we sent (e.g. when the user picks a fine/loan tranche and the upstream
+  // is the only source of truth for the exact sum). Empty = trust the
+  // request amount. Decimal string to preserve NUMERIC(20,4) precision.
+  string confirmed_amount = 4;
+  // error_code is the machine-readable classification, free-form token (e.g.
+  // INVALID_INPUT, INSUFFICIENT_FUNDS, UPSTREAM_DOWN). Required for FAILED;
+  // recommended for RETRY/TIMEOUT; empty for SUCCESS/PENDING.
+  string error_code     = 5;
+}
+
+// Selectable is one entity returned in a precheck list — a tranche, a fine,
+// a billed period, anything the upstream wants the user to pick before
+// payment. id is opaque to the gateway; the upstream interprets it on
+// SubmitPayment via input_data at selection_input_index.
+message Selectable {
+  string id             = 1;
+  string title          = 2;
+  string description    = 3;
+  string amount         = 4; // decimal string
+  string currency       = 5;
+  repeated KV attributes = 6;
+}
+
+message InfoRequest {
+  Endpoint endpoint   = 1;
+  Agent    agent      = 2;
+  Gateway  gateway    = 3;
+  Service  service    = 4;
+  Provider provider   = 5;
+  repeated KV items   = 6;
+}
+
+message InfoResponse {
+  Status status      = 1;
+  string message     = 2;
+  string full_name   = 3;
+  string account     = 4;
+  string address     = 5;
+  string rate        = 6; // decimal string
+  string currency    = 7;
+  string balance     = 8; // decimal string
+  string rest        = 9; // decimal string
+  string to_pay      = 10; // decimal string
+  repeated KV items  = 11;
+
+  // selectables is the list of entities the user must pick from before
+  // submitting a payment (tranches, fines, periods, ...). Empty = no
+  // selection step, the existing flat-payment flow applies.
+  repeated Selectable selectables = 12;
+  // selection_input_index tells the client which slot of input_data on
+  // /v1/payments should carry the chosen Selectable.id. 0-based, matches
+  // service_inputs.index. Only meaningful when selectables is non-empty.
+  int32 selection_input_index = 13;
+  // error_code mirrors PaymentResponse.error_code semantics: required for
+  // FAILED, empty for SUCCESS, optional otherwise.
+  string error_code  = 14;
+}

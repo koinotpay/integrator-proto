@@ -1,0 +1,11 @@
+# Schema-only repo — no language stubs are generated or committed here.
+# Each consumer service runs its own codegen.
+gen/
+go.mod
+go.sum
+
+# Buf cache
+.buf-cache/
+
+# OS
+.DS_Store
